@@ -1,4 +1,4 @@
-import os, csv, time, math, random, json, hashlib
+import os, csv, time, math, random
 import numpy as np
 
 
@@ -9,203 +9,142 @@ import traceback
 
 from torchvision import transforms
 
-from DiT_ProbabilisticAlgotithm.models.dit import DiT2D, DiT2DConfig
-from DiT_ProbabilisticAlgotithm.utils.make_dit_builder import make_dit_builder
-from DiT_ProbabilisticAlgotithm.pnp.pnpstarter import hqs_solve, normalize_sigma
-from DiT_ProbabilisticAlgotithm.data.pcam_starter import show_batch, PCamDataset
-from DiT_ProbabilisticAlgotithm.ops.blur import make_gaussian_kernel, blur2d, mse, psnr
-from DiT_ProbabilisticAlgotithm.utils.utils import set_seed
+from DiT_ProbabilisticAlgotithm.src.models.dit import DiT2D, DiT2DConfig
+from DiT_ProbabilisticAlgotithm.src.utils.make_dit_builder import make_dit_builder
+from DiT_ProbabilisticAlgotithm.src.pnp.pnpstarter import hqs_solve
+from DiT_ProbabilisticAlgotithm.src.data.pcam_starter import show_batch, PCamDataset
+from DiT_ProbabilisticAlgotithm.src.ops.blur import make_gaussian_kernel, blur2d, mse, psnr
+from DiT_ProbabilisticAlgotithm.src.utils.utils import set_seed
 
 
-# -----------------------------
-# utils
-# -----------------------------
-def canoical_run_id(cfg: dict) -> str:
-    s = json.dumps(cfg, sort_keys=True, separators=(',', ':'))
-    return hashlib.sha1(s.encode('utf-8')).hexdigest()[:12]
+def normalize_sigma(sigma, g):
+    if not torch.is_tensor(sigma):
+      sigma = torch.tensor(sigma, device=g.device, dtype=g.dtype)
+    if sigma.ndim == 0:
+      sigma = sigma[None]
+    if sigma.shape[0] == 1 and g.shape[0] > 1:
+      sigma = sigma.repeat(g.shape[0])
+    if sigma.ndim == 2 and sigma.shape[1] == 1:
+      sigma = sigma[:, 0]
+    return sigma
 
-def load_done_ids(csv_path: str) -> set[str]:
-    if not os.path.exists(csv_path):
-        return set()
-    done = set()
-    with open(csv_path, 'r', newline='') as f:
-        r = csv.DictReader(f)
-        for row in r:
-            if 'run_id' in row:
-                done.add(row['run_id'])
-    return done
 
-# -----------------------------
-# adjoint
-# ------------------------------
-@torch.no_grad()
-def adjoint_test(A, AT, shape, device, trials=2, eps=1e-5, seed=2):
-    g = torch.Generator(device=device).manual_seed(seed)
-    errs = []
-    
-    for t in range(trials):
-        x = torch.randn(*shape, device=device, generator=g)
-        y = torch.randn(*shape, device=device, generator=g)
-        
-        Ax = A(x)
-        ATy = AT(y)
-        ls = (Ax * y).sum()
-        rs = (x * ATy).sum()
-        rel = (ls - rs).abs() / (ls.abs() + rs.abs() + eps)
-        errs.append(rel.item())
-        
-    return {
-        'rel_err_mean': float(sum(errs) / len(errs)),
-        'rel_err_min': float(min(errs)),
-        'rel_err_max': float(max(errs)),
-    }
-        
-# -----------------------------
-# index-fixed samples
-# -----------------------------
-def make_fixed_samples(dataset, indices, batch_size=1, num_workers=2):
-    subset = torch.utils.data.Subset(dataset, indices)
-    return DataLoader(subset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
-
-# -----------------------------
-# noise-fixed builder
-# -----------------------------
-@torch.no_grad()
-def make_fixed_noise_builder(A, x_gt, sigma_obs:float, noise_seed: int):
-    g = torch.Generator(device=x_gt.device).manual_seed(noise_seed)
-    n = torch.randn_like(x_gt, generator=g)
-    y = A(x_gt) + sigma_obs * n
-    
-    return y
-
-def make_A_AT(AT_mode, k, sigma_blur):
+def make_A_AT(mode, k, sigma_blur, AT_mode:str, device):
     # Operators A=I
+    A = lambda x: blur2d(x, k=k, sigma=sigma_blur) if 'k' in blur2d.__code__.co_varnames else blur2d(x)
     
-    kernel = make_gaussian_kernel(k=k, sigma=sigma_blur, dtype=torch.float32)
+    kernel = make_gaussian_kernel(k=5, sigma=1.2, device=device, dtype=torch.float32)
     kernel_flip = torch.flip(kernel, dims=[-1, -2])
-    
-    A = lambda x: blur2d(x, kernel)
+
 
     if AT_mode == 'blur':
-        AT = lambda y: blur2d(y, kernel)
-    if AT_mode == 'inverse':
-        AT = lambda y: blur2d(y, kernel_flip)
+        AT = lambda y: blur2d(y, k=k, sigma=sigma_blur) if 'k' in blur2d.__code__.co_varnames else blur2d(y)
+    elif AT_mode == 'inverse':
+        AT = lambda y: blur2d(y, kernel_flip, sigma=sigma_blur)
     else:
         raise ValueError(f'Unknown AT_mode: {AT_mode}')
     
     return A, AT
-
-# -----------------------------
-# runners
-# -----------------------------
-
-def run_phase(
-    phase_name: str,
-    out_csv: str,
-    device, fixed_dataloader,
-    denoiser_bank, make_A_AT_fn,
-    grid, seeds=(0,),
-    topN:int | None = None,
-    sort_key:str = psnr,
-    sort_desc:bool = True,
-):
-    os.makedirs(os.path.dirname(out_csv) or '.', exist_ok=True)
-    done_ids = load_done_ids(out_csv)
-    
-    fieldnames = [
-        "phase","run_id", "seed","denoiser","sigma_obs","k","sigma_blur", "AT_mode","hqs_iters","cg_iters","finite","time","mse_x", "mse_Ax_y","psnr","rel_err_mean", "rel_err_min", "rel_err_max",
-    ]
-    
-    write_header = not os.path.exists(out_csv)
-    rows_rank = []
-    
-    with open(out_csv, 'a', newline="") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames)
-        if write_header:
-            w.writeheader()
         
-        for cfg in grid:
-            for d_name, d_fn in denoiser_bank.items():
-                for seed in seeds:
-                    run_cfg = dict(phase=phase_name, denoiser=d_name, seed=seed, **cfg)
-                    run_id = canoical_run_id(run_cfg)
-                    if run_id in done_ids:
-                        print(f'Skipping done run_id: {run_id}')
-                        continue
-                    
-                    set_seed(seed)
-                    
-                    A, AT = make_A_AT_fn(k=cfg["k"], sigma_blur=cfg["sigma_blur"], AT_mode=cfg["AT_mode"], device=device)
-                    x_gt0, _ = next(iter(fixed_dataloader))
-                    s = tuple(x_gt0.to(device).shape)
-                    adjoint = adjoint_test(A, AT, shape=s, device=device, trials=seed, seed=seed)
-                    
-                    t_0 = time.time()
-                    finite_all = True
-                    mse_x, psnrs, mse_Ax_ys = [], [], []
-                    
-                    for i, (x_gt, _) in enumerate(fixed_dataloader):
-                        x_gt = x_gt.to(device)
-                        
-                        # noise fixed per sample index i + seed
-                        y = make_fixed_noise_builder(A, x_gt, sigma_obs=cfg['sigma_obs'], noise_seed=10_0)
-                        
-                        # HQS
-                        x_hat = hqs_solve(
-                            y, A, AT, d_fn,
-                            iters=cfg['hqs_iters'],
-                            cg_iters=cfg['cg_iters'],
-                        )
-                        
-                        finite_all = finite_all and bool(torch.isfinite(x_hat).all().item())
-                        x_hat = x_hat.clamp(0, 1)
-                        
-                        mse_x.append(mse(x_hat, x_gt))
-                        psnrs.append(psnr(x_hat, x_gt))
-                        mse_Ax_ys.append(mse(A(x_hat), y))
-                        
-                    dt = time.time() - t_0
-                        
-                    out = {
-                        "finite":int(finite_all),
-                        "time":dt,
-                        "mse_x":float(sum(mse_x) / len(mse_x)),
-                        "psnr":float(sum(psnrs) / len(psnrs)),
-                        "mse_Ax_y":float(sum(mse_Ax_ys) / len(mse_Ax_ys)),
-                    }
 
-                    out_row = {
-                        "phase": phase_name,
-                        "run_id": run_id,
-                        "seed": seed,
-                        "denoiser": d_name,
-                        **cfg,
-                        **out,
-                        **adjoint,
-                    }
-                    
-                    w.writerow(out_row)
-                    f.flush()
-                    done_ids.add(run_id) 
-                    rows_rank.append(out_row)
-                    
-                    print(f'Completed run_id: {run_id} | psnr: {out["psnr"]:.4f}')
-                    
-    if topN is not None and len(rows_rank) > 0:
-        row_sorted = sorted(rows_rank, key=lambda r: r.get(sort_key, float('-inf')), reverse=sort_desc)
-        picked = row_sorted[:topN]
-        picked_cfgs = []
-        for r in picked:
-            picked_cfgs.append({
-                'sigma_obs': float(r['sigma_obs']),
-                'k': int(r['k']),
-                'sigma_blur': float(r['sigma_blur']),
-                'AT_mode': r['AT_mode'],
-                'hqs_iters': int(r['hqs_iters']),
-                'cg_iters': int(r['cg_iters']),
-            })
-        return picked_cfgs
-    return None
+@torch.no_grad()
+def run_one(
+    device,
+    x_gt,
+    A, AT, denoiser_fn,
+    sigma_obs:float,
+    hqs_iters:int,
+    cg_iters: int,
+):
+    y = A(x_gt) + sigma_obs * torch.randn_like(x_gt)
+
+    t_0 = time.time()
+    x_hat = hqs_solve(y, A, AT, denoiser_fn, iters=hps_iters, cg_iters=cg_iters)
+    t_hqs = time.time() - t_0
+
+    x_hat_clamp = x_hat.clamp(0, 1)
+
+    out = {
+        "finite": int(torch.isfinite(x_hat).all().item()),
+        "time": t_hqs,
+        "mse_x": mse(x_hat_clamp, x_gt),
+        "psnr": psnr(x_hat_clamp, x_gt),
+        "mse_Ax_y": mse(A(s_hat_clamp), y),
+        "x_hat_mean": x_hat_clamp.mean().item(),
+        "x_hat_min": x_hat_clamp.min().item(),
+        "x_hat_max": x_hat_clamp.max().item(),
+    }
+
+    return out
+
+# -----------------------------
+# grid runner
+# -----------------------------
+def grid_search(
+    out_csv: str,
+    device,
+    dataloader,
+    denoiser_bank: dict,
+    seeds=(0, 1, 2),
+    sigma_obs_list=(0.01, 0.03, 0.05, 0.08),
+    k_list=(3, 5, 7),
+    sigma_blur_list=(0.8, 1.2, 1.6),
+    AT_modes=('blur', 'inverse'),
+    hqs_iters_list=(3, 5, 12),
+    cg_iters_list=(5, 10, 30),
+):
+    os.makedirs(os.path.dirname(out_csv) or ".", exist_ok=True)
+
+    fieldnames = [
+        "seed","denoiser","sigma_obs","k","sigma_blur", "AT_mode","hqs_iters","cg_iters","finite","time","mse_x","psnr","mse_Ax_y","x_hat_mean","x_hat_min","x_hat_max"
+    ]
+
+    write_header = not os.path.exists(out_csv)
+    with open(out_csv, 'a', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if write_header:
+            writer.writeheader()
+        
+        for seed in seeds:
+            set_seed(seed)
+            x_gt, label = next(iter(dataloader))
+            x_gt = x_gt.to(device)
+
+            for d_name, d_fn in denoiser_bank.items():
+                for sigma_obs in sigma_obs_list:
+                    for k in k_list:
+                        for sigma_blur in sigma_blur_list:
+                            for AT_mode in AT_modes:
+                                A, AT = make_A_AT(k=k, sigma_blur=sigma_blur, AT_mode=AT_mode)
+                                for hqs_iters in hqs_iters_list:
+                                    for cg_iters in cg_iters_list:
+                                        out = run_one(
+                                            device=device,
+                                            x_gt=x_gt,
+                                            A=A,
+                                            AT=AT,
+                                            denoiser_fn=d_fn,
+                                            sigma_obs=sigma_obs,
+                                            hqs_iters=hqs_iters,
+                                            cg_iters=cg_iters,
+                                        )
+
+                                        out_row = {
+                                            "seed": seed,
+                                            "denoiser": d_name,
+                                            "sigma_obs": sigma_obs,
+                                            "k": k,
+                                            "sigma_blur": sigma_blur,
+                                            "AT_mode": AT_mode,
+                                            "hqs_iters": hqs_iters,
+                                            "cg_iters": cg_iters,
+                                            **out
+                                        }
+
+                                        writer.writerow(out_row)
+                                        f.flush()
+                                        print(f'row: {row}')
+
 
 def train_anp_pnp():
     print("Starting ANP-PNP Tests...")
@@ -213,15 +152,20 @@ def train_anp_pnp():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
+    B, C, H, W = 1, 3, 32, 32
+    """ 
+    # y=A(x)+noise
+    # PCam synthetic inverse. 
+    A, AT = make_A_AT(mode='blur', k=5, sigma_blur=1.2)
+    """
+
     transform = transforms.Compose([
         transforms.Resize((32, 32)),
         transforms.ToTensor(),
     ])
 
     dataset = PCamDataset(data_root='./data', split='train', transform=transform, download=True)
-    
-    fixed_inidices_1 = [12, 98]
-    fixed_indicess_2 = [12, 98, 301, 777, 1024, 2048, 4096, 5000]
+    dataloader = DataLoader(dataset, batch_size=B, shuffle=True, num_workers=2, pin_memory=True)
 
     # show_batch(dataloader) """
 
@@ -244,6 +188,10 @@ def train_anp_pnp():
         model, cfg = build_model(patch=4).to(device)
     except Exception as e:
         print(f'dit: {e}')
+        """
+        tr=traceback.print_exc()
+            print(tr)
+        """
 
     # Denoiser function G_denoiser for anp_pnp_hqs.
     # It receives complex gradients `g_complex` and a noise level `sigma`.
@@ -255,53 +203,29 @@ def train_anp_pnp():
         return model(g, sigma)
 
     denoisers = {
-        'blur': G_denoiser, # lambda g, sigma: g : # no normalization
-        'inverse': G_denoiser,
+        'blur': G_denoiser,
     }
-    
-    grid_p1 = []
-    
-    for sigma_obs in (0.03, 0.05):
-        for k in (3, 5):
-            for sigma_blur in (0.8, 1.2):
-                for AT_mode in ('blur', 'inverse'):
-                    for hqs_iters in (5, 12):
-                        for cg_iters in (10, 30):
-                            grid_p1.append({
-                                'sigma_obs': sigma_obs,
-                                'k': k,
-                                'sigma_blur': sigma_blur,
-                                'AT_mode': AT_mode,
-                                'hqs_iters': hqs_iters,
-                                'cg_iters': cg_iters,
-                            })
-    
-    top_cfgs = run_phase(
-        phase_name='p1',
-        out_csv='./runs/ablation_pcam_phase1.csv',
-        device=device,
-        fixed_dataloader=make_fixed_samples(dataset, fixed_inidices_1, batch_size=1),
-        denoiser_bank=denoisers,
-        make_A_AT_fn=make_A_AT,
-        grid=grid_p1,
-        seeds=(0,),  # Use more seeds for full experiments
-        topN=10,
-        sort_key='psnr',
-        sort_desc=True,
-    )
-    
-    if top_cfgs:
-        run_phase(
-            phase_name='p2',
-            out_csv='./runs/ablation_pcam_phase2.csv',
+        
+
+    # Test HQS
+    try:
+        print("Testing anp_pnp_hqs...")
+        grid_search(
+            out_csv = './runs/ablation_pcam_hqs.csv',
             device=device,
-            fixed_dataloader=make_fixed_samples(dataset, fixed_indicess_2, batch_size=1),
+            dataloader=dataloader,
             denoiser_bank=denoisers,
-            make_A_AT_fn=make_A_AT,
-            grid=top_cfgs,
-            seeds=(0, 1),
-            topN=None,
+            seeds=(0, 1),  # Use more seeds for full experiments
         )
+        print(f"HQS Success! Results saved to './runs/ablation_pcam_hqs.csv'")
+    except Exception as e:
+        print(f"HQS Failed: {e}")
+        """
+	    import traceback
+        tr = traceback.print_exc()
+        prin(tr)
+	    """
+
 
 if __name__ == "__main__":
     train_anp_pnp()
