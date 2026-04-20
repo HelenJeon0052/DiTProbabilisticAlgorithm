@@ -60,5 +60,4 @@ def hqs_solve(
 
         rhs = ATy() / (sigma_data**2) + mu * div2d_rgb(z)
         x = cg_solve(linop, rhs, x0=x, iters=cg_steps)
-
     return x

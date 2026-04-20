@@ -221,11 +221,14 @@ class MLP(nn.Module):
         return x
 
 
+
 class AdaLayerNorm(nn.Module):
 
     def __init__(self, dim, cond_dim):
         super().__init__()
 
+        self.dim = dim
+        self.cond_dim = cond_dim
 
         self.to_params = nn.Sequential(
             nn.Linear(cond_dim, dim),
@@ -236,25 +239,27 @@ class AdaLayerNorm(nn.Module):
         nn.init.zeros_(self.to_params[-1].weight)
         nn.init.zeros_(self.to_params[-1].bias)
 
-    def forward(self, x, cond):
+    def forward(self, cond):
 
-        x = self.to_params(cond).chunk(6, dim=-1)
 
-        return x, shift_msa, gate_msa, scale_msa, gate_mlp, shift_mlp, scale_mlp
+        params = self.to_params(cond)
+        (shift_msa, gate_msa, scale_msa, gate_mlp, shift_mlp, scale_mlp) = params.chunk(6, dim=-1)
+
+        return (shift_msa, gate_msa, scale_msa, gate_mlp, shift_mlp, scale_mlp)
 
 class Attention(nn.Module):
-    def __init__(self, dim, heads, qkv_bias=True, dropout=0.0):
+    def __init__(self, dim, num_heads, qkv_bias=True, dropout=0.0):
         super().__init__()
-        self.heads = heads
-        assert dim % heads == 0
-        self.d_h = dim // heads
+        self.num_heads = num_heads
+        assert dim % num_heads == 0
+        self.d_h = dim // num_heads
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         self.proj = nn.Linear(dim, dim)
         self.dropout = dropout
 
     def forward(self, x):
         B, N, D = x.shape
-        qkv = self.qkv(x).reshape(B, N, 3, self.heads, self.d_h).permute(2, 0, 3, 1, 4) # (3,B,h,N,dh)
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.d_h).permute(2, 0, 3, 1, 4) # (3,B,h,N,dh)
 
         q, k, v = qkv[0], qkv[1], qkv[2]   # (B,h,N,dh)
 
@@ -266,20 +271,51 @@ class Attention(nn.Module):
 
         return self.proj(out)
 
+
+class FinalLayer(nn.Module):
+    """
+    Continued final head:
+        AdaLayerNorm > adpative shift / scale from cond > zero_init linear
+    """
+
+    def __init__(self, dim, cond_dim, out_dim) -> None:
+        super().__init__()
+        self.norm = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+
+        self.to_shift_scale = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(cond_dim, 2 * dim, bias=True)
+        )
+
+        nn.init.zeros_(self.to_shift_scale[-1].weight)
+        nn.init.zeros_(self.to_shift_scale[-1].bias)
+
+        self.proj = nn.Linear(dim, out_dim, bias=True)
+
+        nn.init.zeros_(self.proj.weight)
+        nn.init.zeros_(self.proj.bias)
+
+    def forward(self, x, cond) -> torch.Tensor:
+        shift, scale = self.to_shift_scale(cond).chunk(2, dim=1)
+        x = modulate(self.norm(x), shift, scale)
+        x = self.proj(x)
+
+        return x
+
+
 class DiTBlock(nn.Module):
     """6D modulation"""
-    def __init__(self, dim, cond_dim, num_heads = 8, mlp_ratio = 4.0, dropout: float = .08):
+    def __init__(self, dim, cond_dim, num_heads = 8, mlp_ratio = 4.0, dropout: float = 0.08):
         super().__init__()
 
         self.norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
         self.attn = Attention(dim, num_heads=num_heads, dropout=dropout)
         self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
-        mlp_t = int(dim * mlp_ratio)
-        approx_gelu = lambda: nn.GELU(approximate='tanh')
-        self.mlp = MLP(dim = dim, hidden_features=mlp_t, act_layer=approx_gelu, drop=dropout)
+        self.mlp = MLP(dim = dim, mlp_ratio=mlp_ratio, dropout=dropout)
+        self.dim = dim
         self.cond_dim = cond_dim
 
-        self.adaLN = AdaLayerNorm(dim, self.cond_dim)
+        self.adaLN = AdaLayerNorm(dim = self.dim, cond_dim = self.cond_dim)
 
     def forward(self, x, cond):
         # x : (B, N, dim), cond: (B, cond_dim)
@@ -291,61 +327,22 @@ class DiTBlock(nn.Module):
         l = modulate(l, shift_msa, scale_msa)
 
         x = x + gate_msa.unsqueeze(1) * self.attn(l)
+        print(f'first_x: {x.shape}')
 
         # mlp
         l = self.norm2(x)
         l = modulate(l, shift_mlp, scale_mlp)
 
         x = x + gate_mlp.unsqueeze(1) * self.mlp(l)
+        print(f'second_x: {x.shape}')
 
         return x
-
-
-"""class DiT3DEps(nn.Module):
-    
-    # DiT 3D eps-predictor
-    
-    def __init__(self, in_channels, dim=384, depth=6, heads=8, patch=(2,4,4),num_classes=2, cfg_drop=0.0):
-        super().__init__()
-        self.patch_embed = PatchEmbed(in_channels, dim, patch=patch)
-        self.t_embed = TimestepEmbedder(dim, frequency_embedding_size=256)
-        self.y_embed = LabelEmbedder(num_classes, dim, dropout_prob=cfg_drop)
-
-        self.pos = None
-        self.blks = nn.ModuleList([DiTBlock(dim, dim, heads=heads) for _ in range(depth)])
-        self.final_norm = nn.LayerNorm(dim)
-        self.unproj = nn.ConvTranspose3d(dim, in_channels, kernel_size=patch, stride=patch)
-
-    def _get_pos(self, grid, device, dim):
-        Dp, Lp, Wp = grid
-        N = Dp * Lp * Wp
-
-        if (self.pos is None) or (self.pos.shape[1] != N) or (self.pos.shape[2] != dim):
-            self.pos = nn.Parameter(torch.zeros(1, N, dim, device=device))
-            nn.init.trunc_normal_(self.pos, std=0.02)
-
-        return self.pos
-
-    def forward(self, x_t, t, y=None):
-        p = self.patch_embed(x_t)
-        tokens, grid = self.patch_emb(p)  # (B, N, E)
-        tokens = tokens + self.pos_embed
-
-        t_emb = timestep_embedding(t, self.time_in)  # (B, time_in)
-        cond = self.time_mlp(t_emb)
-
-        for block in self.blocks:
-            tokens = block(tokens, cond)
-
-        tokens = self.final_linear(tokens)
-        out = self.unpatchify(tokens, grid)
-"""
 
 class PatchEmbed(nn.Module):
     def __init__(self, in_ch: int, embed_dim: int, patch: int) ->  None:
         super().__init__()
         self.patch = patch
-        self.proj = nn.Conv3d(in_ch, embed_dim, kernel_size=patch, stride=patch)
+        self.proj = nn.Conv2d(in_ch, embed_dim, kernel_size=patch, stride=patch)
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Tuple[int, int, int]]:
         x = self.proj(x)
         B, E, Lp, Wp = x.shape
@@ -376,7 +373,6 @@ class UnpatchifyEmbed(nn.Module):
 def init_weights(m):
     if isinstance(m, nn.Linear):
         nn.init.normal(m.weight, std=0.02)
-        print(f'nn.init.normal : {nn.init.normal(m.weight, std=0.02)}')
         if m.bias is not None:
             nn.init.constant_(m.bias, 0)
 
@@ -386,9 +382,9 @@ def init_weights(m):
 
 @dataclass
 class DiT2DConfig:
-    in_channels: int = 4
-    out_channels: int = 4
-    img_size : int = 64
+    in_channels: int = 6
+    out_channels: int = 6
+    img_size : int = 32
     patch: int = 4
     embed_dim : int = 256
     depth : int = 6
@@ -397,6 +393,7 @@ class DiT2DConfig:
     dropout : float = 0.0
     time_in : int = 2
     time_embed_dim : int = 256
+    center_output: bool = True
 
 class DiT2D(nn.Module):
     """
@@ -419,25 +416,41 @@ class DiT2D(nn.Module):
 
         num_tokens = (cfg.img_size // cfg.patch) ** 2
         self.postn = nn.Parameter(torch.zeros(1, num_tokens, cfg.embed_dim))
-
         nn.init.trunc_normal_(self.postn, std=0.02)
 
         self.in_proj = nn.Linear(cfg.embed_dim, cfg.embed_dim)
         self.blocks = nn.ModuleList([
-            DiTBlock(cfg.embed_dim, cfg.embed_dim, cond_dim=cfg.time_embed_dim, num_heads=cfg.num_heads, mlp_ratio=cfg.mlp_ratio, dropout=cfg.dropout)
+            DiTBlock(cfg.embed_dim, cfg.embed_dim, num_heads=cfg.num_heads, mlp_ratio=cfg.mlp_ratio, dropout=cfg.dropout)
             for _ in range(cfg.depth)
         ])
 
         self.out_norm = nn.LayerNorm(cfg.embed_dim, elementwise_affine=False, eps=1e-6)
-        self.out = nn.Linear(cfg.embed_dim, cfg.embed_dim, bias=False)
+        self.out = nn.Linear(cfg.embed_dim, cfg.embed_dim, bias=True)
+
+        self.final = FinalLayer(
+            dim = cfg.embed_dim,
+            cond_dim = cfg.embed_dim,
+            out_dim = cfg.embed_dim
+        )
 
         nn.init.zeros_(self.out.weight)
         nn.init.zeros_(self.out.bias)
 
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        if hasattr(self.unpatchify, "proj"):
+            if getattr(self.unpatchify.proj, "bias", None) is not None:
+                nn.init.zeros_(self.unpatchify.proj.bias)
+
+    def set_pos_embed(self, pos_embed) -> None:
+        self.postn = pos_embed
+
 
     def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         tokens, grid = self.patch(x)
-        tokens = tokens + self.postn
+        if self.postn is not None:
+            tokens = tokens + self.postn
         tokens = self.in_proj(tokens)
 
         cond = self.cond_proj(self.time_emb(t))
@@ -445,7 +458,9 @@ class DiT2D(nn.Module):
         for blk in self.blocks:
             tokens = blk(tokens, cond)
 
-        tokens = self.out(self.out_norm(tokens))
+        tokens = self.final(self.out_norm(tokens), cond)
         eps = self.unpatchify(tokens, grid)
 
+        if self.cfg.center_output:
+            eps = eps - eps.mean(dim=(1, 2, 3), keepdim = True)
         return eps

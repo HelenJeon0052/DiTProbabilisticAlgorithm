@@ -73,3 +73,24 @@ def blur2d(x, kernel):
 
     return F.conv2d(x, w, padding=k//2, groups=x.shape[1])
 
+@torch.no_grad()
+def estimate_optimal_norm(A, AT, x_0, device, iters=10, eps=1e-10):
+    """
+    estimate ||A||^2 via power iteration on (A^T A)
+    return : scalar (float, approximation of norm A)
+    """
+
+    x = torch.randn_like(x_0).to(device)
+    x = x / (x.norm() + eps)
+
+
+    for _ in range(iters):
+        y = A(x)
+        x = AT(y)
+        n = x.norm() + eps
+        x = x / n
+    
+    y = A(x)
+    opt = y.norm()
+    return float(opt)
+    

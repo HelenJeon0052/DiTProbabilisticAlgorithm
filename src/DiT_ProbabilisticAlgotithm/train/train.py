@@ -11,9 +11,9 @@ from torchvision import transforms
 
 from DiT_ProbabilisticAlgotithm.src.models.dit import DiT2D, DiT2DConfig
 from DiT_ProbabilisticAlgotithm.src.utils.make_dit_builder import make_dit_builder
-from DiT_ProbabilisticAlgotithm.src.pnp.pnpstarter import hqs_solve
+from DiT_ProbabilisticAlgotithm.src.pnp.pnpstarter import hqs_solve, normalize_sigma
 from DiT_ProbabilisticAlgotithm.src.data.pcam_starter import show_batch, PCamDataset
-from DiT_ProbabilisticAlgotithm.src.ops.blur import make_gaussian_kernel, blur2d, mse, psnr
+from DiT_ProbabilisticAlgotithm.src.ops.blur import make_gaussian_kernel, blur2d, mse, psnr, estimate_optimal_norm
 from DiT_ProbabilisticAlgotithm.src.utils.utils import set_seed
 
 
@@ -46,6 +46,66 @@ def make_A_AT(mode, k, sigma_blur, AT_mode:str, device):
     
     return A, AT
         
+
+class DenoiserWrapper:
+  def __init__(self, model, diffusion_instance, opt_norm=None, eps=1e-10, log=False):
+    self.model = model
+    self.diffusion_instance = diffusion_instance
+    self.opt_norm = opt_norm
+    self.eps = eps
+    self.log = log
+
+  @torch.no_grad()
+  def _from_diffusion(self, device):
+    return calibration_k(0.02, 23, self.diffusion_instance, device=device)
+
+  @torch.no_grad()
+  def to_t(self, sigma_v, sigma_schedule, device):
+    
+    sigma_processed = torch.as_tensor(sigma_v, device=device).float()
+    if sigma_processed.ndim == 0:
+      sigma_processed = sigma_processed[None]
+
+    dist = (sigma_processed[:, None] - sigma_schedule[None, :]).abs()
+    t_indices = dist.argmin(dim=1).long()
+
+    return t_indices
+
+  @torch.no_grad()
+  def __call__(self, g, sigma):
+    B = g.shape[0]
+    device = g.device
+
+    alpha_bar_tensor, sc_c, sigma_schedule = self._from_diffusion(device=device)
+    print("sigma_schedule min/max:", sigma_schedule.min().item(), sigma_schedule.max().item())
+
+    sigma = normalize_sigma(sigma, g)
+
+    if torch.is_tensor(sigma):
+      sigma_v = sigma.to(device).float()
+      if sigma_v.ndim == 0:
+        sigma_v = sigma_v.expand(B)
+    else:
+      sigma_v = torch.full((B,), float(sigma), device)
+
+    if self.opt_norm is not None:
+      sigma_v = sigma_v / (float(self.opt_norm) + self.eps)
+    else:
+      sigma_v = (sc_c * sigma_v) / (self.opt_norm + self.eps)
+
+    t = self.to_t(sigma_v, sigma_schedule, device)
+
+    if self.log:
+      print("g:", tuple(g.shape),
+            "sigma_v:", sigma_v,
+            "t_indices range:", int(t.min()), "to", int(t.max()),
+            "schedule start/end:", float(sigma_schedule[0]), float(sigma_schedule[-1])
+      )
+
+    model_out = self.model(g, t)
+    
+    return model_out
+
 
 @torch.no_grad()
 def run_one(
@@ -110,12 +170,14 @@ def grid_search(
             x_gt, label = next(iter(dataloader))
             x_gt = x_gt.to(device)
 
+            
             for d_name, d_fn in denoiser_bank.items():
                 for sigma_obs in sigma_obs_list:
                     for k in k_list:
                         for sigma_blur in sigma_blur_list:
                             for AT_mode in AT_modes:
                                 A, AT = make_A_AT(k=k, sigma_blur=sigma_blur, AT_mode=AT_mode)
+                                opt = estimate_optimal_norm(A, AT, x_gt, device, iters = 10)
                                 for hqs_iters in hqs_iters_list:
                                     for cg_iters in cg_iters_list:
                                         out = run_one(
@@ -196,9 +258,12 @@ def train_anp_pnp():
     # Denoiser function G_denoiser for anp_pnp_hqs.
     # It receives complex gradients `g_complex` and a noise level `sigma`.
     # It should return denoised complex gradients.
-    def G_denoiser(g, sigma):
-        print(f'g.shape:', tuple(g.shape), 'sigma:', sigma)
-        sigma = normalize_sigma(sigma, g)
+    def G_denoiser(g, sigma, opt, log = True):
+        denoiser_wrapper_instance = DenoiserWrapper(build_model, diffusion_instance, opt_norm = opt, log = log)
+
+        # Run the wrapper
+        model_prediction = denoiser_wrapper_instance(g, sigma)
+        sigma_n = normalize_sigma(sigma, g)
 
         return model(g, sigma)
 
@@ -220,11 +285,11 @@ def train_anp_pnp():
         print(f"HQS Success! Results saved to './runs/ablation_pcam_hqs.csv'")
     except Exception as e:
         print(f"HQS Failed: {e}")
-        """
-	    import traceback
+        
+        import traceback
         tr = traceback.print_exc()
-        prin(tr)
-	    """
+        print(tr)
+
 
 
 if __name__ == "__main__":

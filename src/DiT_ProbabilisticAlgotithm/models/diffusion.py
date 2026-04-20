@@ -48,6 +48,7 @@ class DiffusionSchedule:
         self.beta_start = cfg.beta_start
         self.beta_end = cfg.beta_end
         self.kind = 'cosine' # 'linear'
+        self.register_buffer = register_buffer
 
     def betas(self, device) -> torch.Tensor:
         if self.kind == 'linear':
@@ -55,8 +56,8 @@ class DiffusionSchedule:
 
         elif self.kind == 'cosine':
             steps = self.T
-            s = .008
-            t = torch.linspace(0, steps, steps + 1, device=device) /steps
+            s = 0.008
+            t = torch.linspace(0, steps, steps + 1, device = device) / steps
             f = torch.cos(((t + s) / (1 + s)) * math.pi /2) ** 2
             alpha_bar = f / f[0]
             betas = 1 - (alpha_bar[1:] / alpha_bar[:-1])
@@ -68,16 +69,25 @@ class DiffusionSchedule:
 
     """
     inverse loop : pre > stale
+    """
+    
     def precompute(self, device) -> Dict[str, torch.Tensor]:
+        # betas >> fixed schedule tensor
         betas = self.betas(device)
         alphas = 1.0 - betas
         alpha_bar = torch.cumprod(alphas, dim=0)
         sqrt_alpha_bar = torch.sqrt(alpha_bar)
-        sqrt_one_minus_alpha_bar = torch.sqrt(1 - alpha_bar)
 
-        alpha_bar_prev = torch.cat([torch.ones(1, device=device), alpha_bar[:-1]], dim=0)
-        posterior_var = betas * (1.0 - alpha_bar_prev) / (1.0 - alpha_bar)
+        one_minus_alpha_bar = (1 - alpha_bar).clamp(min = 0.0)
+        sqrt_one_minus_alpha_bar = torch.sqrt(one_minus_alpha_bar)
+
+        alpha_bar_prev = torch.cat([torch.ones(1, device=device, dtype=alpha_bar.dtype), alpha_bar[:-1]], dim=0)
+        posterior_var = betas * (1.0 - alpha_bar_prev) / (1.0 - alpha_bar).clamp(min = 1e-20)
         posterior_var = posterior_var.clamp(min=1e-20)
+        posterior_log = torch.log(posterior_var)
+
+        posterior_coeff1 = betas * torch.sqrt(alpha_bar_prev) / (1 - alpha_bar).clamp(1e-20)
+        posterior_coeff2 = (1.0 - alpha_bar_prev) * torch.sqrt(alphas) / (1 - alpha_bar).clamp(1e-20)
 
         return dict(
             betas=betas,
@@ -87,13 +97,11 @@ class DiffusionSchedule:
             sqrt_one_minus_alpha_bar=sqrt_one_minus_alpha_bar,
             alpha_bar_prev=alpha_bar_prev,
             posterior_var=posterior_var,
+            posterior_log = posterior_log,
+            posterior_coeff1 = posterior_coeff1,
+            posterior_coeff2 = posterior_coeff2,
         )
-    """
-
-def extract(a: torch.Tensor, t: torch.Tensor, x_shape: torch.Size) ->  torch.Tensor:
-    B = t.shape[0]
-    out = a.gather(0, t) # (B,)
-    return out.view(B, *([1] * (len(x_shape) - 1)))
+    
 
 # -------------------------------
 # Diffusion Class
@@ -110,12 +118,19 @@ class GaussianDiffusion(nn.Module):
         eps = 1e-5
 
         alpha_bar = torch.cumprod(alphas, dim=0)
-        alpha_bar_prev = torch.cat([torch.ones(1, device=device), alpha_bar[:-1]], dim=0)
-
-
+        alpha_bar_prev = torch.cat([torch.ones(1, device=device, dtype=alpha_bar.dtype), alpha_bar[:-1]], dim=0)
 
         sqrt_alpha_bar = torch.sqrt(alpha_bar)
-        sqrt_one_minus_alpha_bar = torch.sqrt(1 - alpha_bar)
+
+
+        one_minus_alpha_bar = (1 - alpha_bar).clamp(min = 0.0)
+        sqrt_one_minus_alpha_bar = torch.sqrt(one_minus_alpha_bar)
+
+        posterior_var = betas * (1.0 - alpha_bar_prev) / (1.0 - alpha_bar).clamp(min = 1e-20)
+        posterior_var = posterior_var.clamp(min=1e-20)
+        posterior_log = torch.log(posterior_var)
+
+
 
         self.register_buffer('betas', betas)
         self.register_buffer('alphas', alphas)
@@ -123,7 +138,10 @@ class GaussianDiffusion(nn.Module):
 
         self.register_buffer('alpha_bar_prev', alpha_bar_prev)
         self.register_buffer('sqrt_alpha_bar', sqrt_alpha_bar)
+        self.register_buffer('one_minus_alpha_bar', one_minus_alpha_bar)
         self.register_buffer('sqrt_one_minus_alpha_bar', sqrt_one_minus_alpha_bar)
+        self.register_buffer('posterior_var', posterior_var)
+        self.register_buffer('posterior_log', posterior_log)
 
         posterior_variance = betas * (1.0 - alpha_bar_prev) / (1.0 - alpha_bar)
         self.register_buffer('posterior_variance', posterior_variance.clamp(min=eps))
@@ -177,7 +195,7 @@ class GaussianDiffusion(nn.Module):
         x0 = self.predict_x0_from_eps(x_t, t, eps_hat)
 
         ab = self._extract(self.alpha_bar, t, x_t.shape)
-        ab_prev = self._extract(self.alpha_bar_prev, t_prev, x_t.shape)
+        ab_prev = self._extract(self.alpha_bar, t_prev, x_t.shape)
 
         # sigma per DDIM
         # DDIM(η>0): stochastic sampling
@@ -210,7 +228,10 @@ class GaussianDiffusion(nn.Module):
         var = self._extract(self.posterior_variance, t, x_t.shape)
 
         eps_hat = model(x_t, t)
-        x0_hat = (x_t - torch.sqrt(1.0 - alpha_bar_t)*eps_hat) / (torch.sqrt(alpha_bar_t) + 1e-12)
+        x0_hat = (x_t - torch.sqrt(1.0 - alpha_bar_t) * eps_hat) / (torch.sqrt(alpha_bar_t) + 1e-12)
+        # setting valid range
+        x0_hat = x0_hat.clamp(-1.0, 1.0)
+
 
         # posterior mean
         coef1 = torch.sqrt(alpha_bar_prev) * betas_t / (1.0 - alpha_bar_t + 1e-12)
@@ -219,6 +240,7 @@ class GaussianDiffusion(nn.Module):
 
         # if t == 0, return mean (no noise)
         noise = torch.randn_like(x_t)
+        # broadcast correctly
         nonzero = (t != 0).float().view(-1, *([1] * (x_t.dim() - 1)))
 
         return mu + nonzero * torch.sqrt(var) * noise
@@ -240,14 +262,15 @@ class GaussianDiffusion(nn.Module):
             t = torch.full((shape[0],), ti, device=device, dtype=torch.long)
             x = self.p_sample_ddpm(x, t, model)
 
+            if ti % 20 == 0 or ti < 10:
+                print(
+                    f"t={ti:03d} | "
+                    f"min={x.min().item():.4e}, "
+                    f"max={x.max().item():.4e}, "
+                    f"mean={x.mean().item():.4e}, "
+                    f"std={x.std().item():.4e}"
+                )
+                
+
         return x
 
-"""diffusion = GaussianDiffusion
-sample = diffusion.sample_ddpm(model, (1, 4, 64, 64), device)
-
-print(
-    sample.min().item(),
-    sample.max().item(),
-    sample.mean().item(),
-    sample.std().item()
-)"""
