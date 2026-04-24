@@ -1,9 +1,12 @@
 import torch
 import torch.nn.functional as F
 
+
+import torch.nn as nn
+
 from DiT_ProbabilisticAlgotithm.ops.blur import synth_blur_noise, psnr
 from DiT_ProbabilisticAlgotithm.pnp.grad import grad2d_rgb
-from DiT_ProbabilisticAlgotithm.pnp.pnpstarter import hqs_solve, normalize_sigma
+from DiT_ProbabilisticAlgotithm.pnp.pnpstarter import hqs_solve
 from DiT_ProbabilisticAlgotithm.eval.mc_dropout import enable_mc_dropout
 from DiT_ProbabilisticAlgotithm.eval.coverage_risk import coverage_risk, coverage_risk_std, uncertainty_scores
 from DiT_ProbabilisticAlgotithm.utils.utils import make_mu_schedule
@@ -21,44 +24,27 @@ def sigma_to_batch(sigma, g):
         sigma = sigma.expand(b)
     return sigma
 
-def pnp_mc_dropout(y, A, AT, model, K=8, debug=False):
+
+def pnp_mc_dropout(x_hat_clamp, y, A, AT, model, sigma: float, k: int, clamp_fn = None, dc_weight: float = 1.0, debug: bool = True):
 
     enable_mc_dropout(model)
 
     xs = []
 
-    for _ in range(K):
-        def G_denoiser(g, sigma):
-            sigma = sigma_to_batch(sigma, g)
-            sigma = normalize_sigma(sigma, g)
 
-            return model(g, sigma)
+    for _ in range(k):
+        residual = A(x_hat_clamp) - y
+        x_hat_out = x_hat_clamp - dc_weight * AT(residual)
 
-        # Test HQS
-        try:
-            print("Testing anp_pnp_hqs...")
-            x_hat, _track = hqs_solve(y, A, AT, G_denoiser, iters=5, cg_iters=5)
-            print(f"HQS Success! Output shape: {x_hat.shape}")
-            print(
-                    f'finite:{torch.isfinite(x_hat).all().item()}, mean: {x_hat.abs().mean().item()}, min/max: {x_hat.min().item()}/{x_hat.max().item()}')
-        except Exception as e:
-            if debug:  
-                import traceback
-                traceback.print_exc()
-            x_hat = torch.full_like(y, float('nan'))
-            print(f"HQS Failed: {e}")
-
-        xs.append(x_hat)
+        xs.append(x_hat_clamp)
 
     xs = torch.stack(xs, dim=0)
-    mean = xs.mean(0)
-    var = xs.var(0)
-
-    u_strong = var.mean(dim=(1, 2, 3)) # [B]
+    xs_mean = xs.mean(dim=0)
+    xs_var = xs.var(dim=0, unbiased=False)
 
 
 
-    return mean, u_strong, xs
+    return xs_mean, xs, xs_var
 
 @torch.no_grad()
 def ssim_per_sample(x: torch.Tensor, y: torch.Tensor, win_size = 11, sigma = 1.5, data_range=1.0, K1=0.01, K2=0.03, eps=1e-10):
@@ -106,95 +92,20 @@ def ssim_per_sample(x: torch.Tensor, y: torch.Tensor, win_size = 11, sigma = 1.5
     print(f'ssim_map: {ssim_map.mean(dim=(2, 3)).mean(dim=1)}')
     
     return ssim_map.mean(dim=(2, 3)).mean(dim=1)
+
+
     
-def assert_shapes(x_hat, g, z):
-    if g.ndim != 4:
-        raise RuntimeError(f"g must be [B,C,H,W], got {tuple(g.shape)}")
-    if z.shape != g.shape:
-        raise RuntimeError(f"denoiser output z must match g. g={tuple(g.shape)} z={tuple(z.shape)}")
-    if x_hat.ndim != 4:
-        raise RuntimeError(f"x_hat must be [B,3,H,W], got {tuple(x_hat.shape)}")
     
-@torch.no_grad()
-def eval_on_setting(
-        x,
-        blur_sigma,
-        noise_sigma,
-        model,
-        iters,
-        mu_kind,
-        risk_fn,
-        track,
-        strong_K=5,
-        debug = True
-):
-
-    y, blur = synth_blur_noise(x, blur_sigma=blur_sigma, noise_sigma=noise_sigma)
-    A, AT = blur.A, blur.AT
-    if debug:
-        print(f'blur: {blur.A} | {blur.AT}')
-
-    mu = make_mu_schedule(mu_kind, iters, x.device)
 
 
-    # low / medium from single deterministic/ema run
-    model.eval()
 
-    def G_denoiser(g, sigma):
-        sigma = sigma_to_batch(sigma, g)
-        sigma = normalize_sigma(sigma, g)
 
-        return model(g, sigma)
 
-    out = hqs_solve(
-        y, A, AT, G_denoiser, iters=iters, sigma_data=max(noise_sigma, 1e-6), mu_schedule=mu, cg_iters=20
-    )
-    
-    if isinstance(out, tuple):
-        x_hat, track = out
-        fail_shape = None
-        fail_shape = x_hat.shape
-        
-        if fail_shape is None:
-            print(f'fail_shape: {fail_shape}')
-            raise ValueError('solver shape mismatch')
-    else:
-        x_hat, track = out, None
-    
-    x_hat = x_hat.clamp(0, 1)
-    print("x_hat:", tuple(x_hat.shape))
 
-    g_last = grad2d_rgb(x_hat)
-    sigma_last = (1.0 / torch.sqrt(mu[-1])).item()
-    z_last = G_denoiser(g_last, sigma_last)
-    assert_shapes(x_hat, g_last, z_last)
-    # assert z_last.shape == g_last.shape, f'z_last.shape == g_last.shape'
-    
-    u_low, u_medium, u_strong = uncertainty_scores(x_hat, y, A, g_last, z_last, track, strong_K = strong_K, strong_eps = 0.05, strong_fn=None)
-    
-    ssim_det = ssim_per_sample(x_hat, x).clamp(0.0, 1.0)
-    
-    """
-    mean_mc, u_strong, xs = pnp_mc_dropout(
-        y=y, blur=blur, model=model, mu_schedule=mu, iters=iters, sigma_data=max(noise_sigma, 1e-6), cg_iters=20, K=K_strong
-    )
 
-    risk_mc = (1.0 - ssim_per_sample(mean_mc.clamp(0, 1), x)).clamp_min(0.0)
-    ssim_mc = ssim_per_sample(mean_mc.clamp(0, 1), x).clamp(0.0, 1.0)"""
-    
-    if risk_fn is None:
-        risk = (1.0 - ssim_det).clamp_min(0.0)
-    else:
-        risk=risk_fn(x_hat, x)
 
-    return {
-        'risk': risk,
-        'u_low': u_low, 'u_medium': u_medium, 'u_strong': u_strong,
-        'psnr': psnr(x_hat, x), 'ssim': ssim_det.mean().item(),
-    }
 
 # coverage-risk
-
 def expected_aurc_first(risk: torch.Tensor) -> float:
     rk = risk.detach().float().cpu()
     N = rk.numel()
@@ -232,12 +143,12 @@ def aurc_with_correction(uncertainty: torch.Tensor, risk: torch.Tensor, *, std: 
     
     out = {
         'coverage':cov,
-        'com_risk': cr,
+        'cum_risk': cr,
         'aurc': float(aurc),
         'e_aurc_random': float(e_aurc),
         'eaurc': float(eaurc_0),
         'naurc': float(naurc_0),
-        std: bool(std),
+        'std': bool(std),
     }
     
     if verbose:
@@ -245,33 +156,68 @@ def aurc_with_correction(uncertainty: torch.Tensor, risk: torch.Tensor, *, std: 
     
     return out
 
-def sanity_check(uncertainty: torch.Tensor, risk: torch.Tensor, *, std: bool= True):
+def sanity_check(uncertainty: torch.Tensor, risk: torch.Tensor, *, std: bool= True, target_coverage: float = 0.15):
+    
+    uncertainty = torch.as_tensor(uncertainty).reshape(-1).float()
+    risk = torch.as_tensor(risk).reshape(-1).float()
+    
+    if uncertainty.numel() != risk.numel():
+        raise ValueError(f"mismatch size: uncertainty = {uncertainty.numel()}, risk = {risk.numel()}")
+    if not torch.isfinite(uncertainty).all():
+        raise ValueError(f"uncertainty having non-finite value")
+    if not torch.isfinite(risk).all():
+        raise ValueError(f"risk having non-finite value")
+    
     out = aurc_with_correction(uncertainty, risk, std=std, verbose=False)
     
-    cr = torch.tensor(out['cum_risk'])
-    cov = torch.tensor(out['coverage'])
+    cr = out["cum_risk"].detach().clone().to(torch.float32) # torch.tensor(out['cum_risk'], dtype=torch.float32)
+    coverage = out["coverage"].detach().clone().to(torch.float32)
     
     if std:
-        target = .15
-        idx = int(torch.argmin((cov - target).abs()).item())
+        idx = int(torch.argmin((coverage - target_coverage).abs()).item())
     else:
-        idx = max(0, int(0.1 * (len(cov) - 1)))
+        idx = max(0, int(target_coverage * (len(coverage) - 1)))
         
+    summary = {
+        "risk_full": float(cr[-1].item()),
+        "risk_at_target": float(cr[idx].item()),
+        "coverage_target": float(coverage[idx].item()),
+        "improves": bool(cr[idx] <= cr[-1]),
+    }
+    
     print(f'[std={std}] | risk@full={cr[-1].item():.6g} | risk@~15%={cr[idx].item():.6g}')
     print(f'compare risk@full={cr[-1].item():.6g} and risk@~15%={cr[idx].item():.6g}')
     
-    
+    return summary    
+
+
 def evaluate_uncertainty(res:dict, *, std: bool = True, verbose: bool = True):
     """
     expect : res['u_low'], res['u_medium'], res['u_strong']
     returns : dict with per-score curves + metrics
     """
     
-    risk = res['risk']
+    indicators = ["u_low", "u_medium", "u_strong", "risk"]
+    missing = [k for k in indicators if k not in res]
+    if missing:
+        raise KeyError(f"missing keys in res: {missing}")
+    
+    risk = torch.as_tensor(res["risk"]).reshape(-1).float()
+    if not torch.isfinite(risk).all():
+        raise ValueError(f"risk having non-finite value")
+        
+    
     outs = {}
     
-    for key in ['u_low', 'u_medium', 'u_strong']:
-        outs[key] = aurc_with_correction(res[key], risk, std=std, verbose=False)
+    for key in ["u_low", "u_medium", "u_strong"]:
+        score = torch.as_tensor(res[key]).reshape(-1).float()
+
+        if score.numel() != risk.numel():
+            raise ValueError(f"mismatch of score and risk, score = {score.numel()} | risk = {risk.numel()}")
+        if not torch.isfinite(score).all():
+            raise ValueError(f"score having non-finite value")
+        
+        outs[key] = aurc_with_correction(score, risk, std=std, verbose=False)
         if verbose:
             print(
                 f"{key:8s} | AURC={outs[key]['aurc']:.6g}"

@@ -48,7 +48,7 @@ class DiffusionSchedule:
         self.beta_start = cfg.beta_start
         self.beta_end = cfg.beta_end
         self.kind = 'cosine' # 'linear'
-        self.register_buffer = register_buffer
+        # self.register_buffer = register_buffer
 
     def betas(self, device) -> torch.Tensor:
         if self.kind == 'linear':
@@ -148,9 +148,11 @@ class GaussianDiffusion(nn.Module):
 
     @staticmethod
     def _extract(a: torch.Tensor, t: torch.Tensor, x_shape: torch.Size) -> torch.Tensor:
+        t = t.to(device=a.device, dtype=torch.long)
+        print(f"t: {t} | {type(t)}")
+
         B = t.shape[0]
         out = a.gather(0, t)
-
         return out.view(B, *([1] * (len(x_shape) - 1)))
 
     def q_sample(self, x0: torch.Tensor, t: torch.Tensor, noise=None) -> torch.Tensor:

@@ -254,6 +254,7 @@ def train_anp_pnp():
     L, W = tmp_g.shape[-2], tmp_g.shape[-1]
     in_ch, out_ch = tmp_g.shape[1], tmp_g.shape[1]
     assert L == W, (L, W)
+
     dit_config = DiT2DConfig(
         in_channels=in_ch,  
         out_channels=out_ch,  # DiT model outputs noise of same shape
@@ -266,19 +267,10 @@ def train_anp_pnp():
         dropout=0.0,  
         time_embed_dim=256  
     )
+    
     try:
         build_model = make_dit_builder(DiT2D, dit_config)
-        try:
-            out = build_model()
-        except TypeError:
-            out = build_model(patch=dit_config.patch)
-            
-        if isinstance(out, tuple) and len(out) == 2:
-            model, cfg = out
-        else:
-            model, cfg = out, dit_config
-        
-        model = model.to(device)
+        out = build_model(patch=dit_config.patch).to(device)
         
     except Exception as e:
         print(f'dit: {e}')
@@ -286,52 +278,7 @@ def train_anp_pnp():
         traceback.print_exc()
         raise ValueError('model shape')
 
-    # Denoiser function G_denoiser for anp_pnp_hqs.
-    # It receives complex gradients `g_complex` and a noise level `sigma`.
-    # It should return denoised complex gradients.
-    def G_denoiser(g, sigma):
-        print(f'g.shape:', tuple(g.shape), 'sigma:', sigma)
-        sigma = sigma_to_batch(sigma, g)
-        sigma = normalize_sigma(sigma, g)
-
-        return model(g, sigma)
-
-    denoisers = {
-        'blur': G_denoiser,
-    }
     
-    
-    
-    # eval
-    res = eval_on_setting(
-        x=x,
-        blur_sigma=1.2,
-        noise_sigma=.01,
-        strong_K = 5,
-        mu_kind='cosine',
-        model=model,
-        risk_fn=None,
-        debug=True
-    )
-    
-    print(
-        f'[DET] psnr= {res['psnr']:.5g} | ssim = {res['ssim']:.5g}'
-    )
-    
-    if evaluate_uncertainty is not None:
-        in_outs = {
-            'u_low': res['u_low'],
-            'u_medium': res['u_medium'],
-            'u_strong': res['u_strong'],
-            'risk': res['risk']
-        }
-        outs = evaluate_uncertainty(in_outs, std=True, verbose=True)
-    
-        sanity_check(res['u_low'], res['risk'], std=True)
-        sanity_check(res['u_strong'], res['risk'], std=True)
-        
-        return res, outs
-
     """grid = GridConfig(
         blur_sigmas = (0.0, 0.7, 1.2),
         noise_sigma = (0.0, 0.01, 0.03),
@@ -343,22 +290,7 @@ def train_anp_pnp():
         std_aurc = True,
         AT_mode='blur'
         use_mc_risk = True,
-    )
-
-    # Test HQS
-    try:
-        print("Testing anp_pnp_hqs...")
-        grid_search(
-            out_csv = './runs/ablation_pcam_hqs.csv',
-            device=device,
-            dataloader=dataloader,
-            denoiser_bank=denoisers,
-            seeds=(0, 1),
-            grid=grid,
-        )
-        print(f"HQS Success! Results saved to './runs/ablation_pcam_hqs.csv'")
-    except Exception as e:
-        print(f"HQS Failed: {e}")"""
+    )"""
     
 if __name__ == "__main__":
     train_anp_pnp()

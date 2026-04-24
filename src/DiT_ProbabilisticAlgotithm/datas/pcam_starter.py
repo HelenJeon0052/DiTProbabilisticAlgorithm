@@ -6,73 +6,71 @@ from torch.utils.data import DataLoader, Dataset
 
 import matplotlib.pyplot as plt
 import numpy as np
+from pathlib import Path
+import os
+from typing import Any, Callable, Optional, Tuple
+from DiT_ProbabilisticAlgotithm.datas.mdz import loading_pcam_md
 
-BATCH_SIZE = 64 # * (3.5)
-IMG_SIZE = 224
-DATA_ROOT = './data'
+
 SEED = 42
-
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 
+
+
+
+
+
+
 torch.manual_seed(SEED)
+
+
+
+def pcam_split_exists(root: str, split: str):
+    if split not in PCAM_FILES:
+        raise ValueError(f"Invalid split: {split!r} | expected one of {set(PCAM_FILES)}")
+
+    base_dir = Path(root) / "pcam"
+    return all((base_dir / filename).is_file() for filename in PCAM_FILES[split])
+
 
 def build_transforms(img_size: int, train: bool) -> transforms.Compose:
     base = [transforms.Resize((img_size, img_size))]
 
     if train:
         base += [
-                    transforms.RandomHorizontalFlip(p=.5),
+                    transforms.RandomHorizontalFlip(),
                 ]
 
     base += [transforms.ToTensor(), transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),] # [0, 1]
 
     return transforms.Compose(base)
 
-train_transforms = build_transforms(IMG_SIZE, train=True)
-eval_transforms = build_transforms(IMG_SIZE, train=False)
+def load_pcam_datasets(root:str, train_transforms, val_transforms, download: bool = True):
+    print(f"root: {root}")
 
-
-def load_pcam_datasets(root:str, train_transforms, eval_transforms, download: bool = True):
-    train_dataset = torchvision.datasets.PCAM(root=root, split='train', transform=train_transforms, download=download)
-    val_dataset = torchvision.datasets.PCAM(root=root, split='val', transform=eval_transforms, download=download)
-    test_dataset = torchvision.datasets.PCAM(root=root, split='test', transform=eval_transforms, download=download)
+    # when gdown denies ...
+    # loading_pcam_md(root = root, splits = ("train", "val", "test"), download = download)
+    
+    train_dataset = PCamDataset(data_root=root, split='train', transform=train_transforms, download=download)
+    val_dataset = PCamDataset(data_root=root, split='val', transform=val_transforms, download=download)
+    test_dataset = PCamDataset(data_root=root, split='test', transform=val_transforms, download=download)
 
     return train_dataset, val_dataset, test_dataset
 
-train_dataset, val_dataset, test_dataset = load_pcam_datasets(
-    root = DATA_ROOT,
-    train_transforms = train_transforms,
-    eval_transforms = eval_transforms,
-    download = True
-)
 
-# root: download data, download = True
-print('dataset loaded')
 
-def make_loader(dataset, batch_size: int, shuffle: bool, num_workers: int = 2):
-    use_cuda = torch.cuda.is_available()
+def make_loader(dataset, batch_size, shuffle, num_workers, pin_memory):
 
     return DataLoader(
-        dataset,
+        dataset = dataset,
         batch_size = batch_size,
         shuffle = shuffle,
         num_workers = num_workers,
-        pin_memory = use_cuda,
+        pin_memory = True,
         drop_last = False,
         persistent_workers = (num_workers > 0),
     )
-# Generated via DataLoader
-
-train_loader = make_loader(train_dataset, BATCH_SIZE, shuffle=True, num_workers=2)
-val_loader = make_loader(val_dataset, BATCH_SIZE, shuffle=False, num_workers=2)
-test_loader = make_loader(test_dataset, BATCH_SIZE, shuffle=False, num_workers=2)
-
-print(f'train dataset: {len(train_dataset)}')
-print(f'val dataset: {len(val_dataset)}')
-print(f'test dataset: {len(test_dataset)}')
-
-
 
 # ------------------------------
 # visualizing
@@ -91,69 +89,75 @@ def denormalize(img_chw: torch.Tensor, mean=IMAGENET_MEAN, std=IMAGENET_STD) -> 
 
     return x.permute(1, 2, 0).cpu().numpy()
 
+def require_pcam_split(root: str, split: str):
+    base_dir = Path(root) / "pcam"
+    missing = [
+        str(base_dir / filename)
+        for filename in PCAM_FILLES[split]
+        if not (base_dir / filename).is_file()
+    ]
 
-def show_batch(loader, num_images: int = 10, cols: int = 5, title: str='batch'):
+    if missing:
+        raise FileNotFoundError(
+            f"PCAM split {split!r} is not complete\n"
+            +"\n".join(missing)
+        )
+
+def show_batch(
+    loader,
+    num_images: int = 10,
+    cols: int = 5,
+    title: str = "batch",
+    denormalize: bool = True,
+):
     images, labels = next(iter(loader))
+
+    images = images.detach().cpu()
+    labels = labels.detach().cpu()
 
     num_images = min(num_images, images.size(0))
     rows = int(np.ceil(num_images / cols))
-    plt.figure(figsize=(cols * 3, rows * 3))
 
-    mean = np.array([0.485, 0.456, 0.406])
-    std = np.array([0.229, 0.224, 0.225])
+    mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+    std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+
+    plt.figure(figsize=(cols * 3, rows * 3))
+    plt.suptitle(title, fontsize=14)
 
     for i in range(num_images):
-        # ax = plt.subplot(2, 5, i+1)
-        img = images[i].numpy().transpose((1, 2, 0))
-        img = std * img + mean
-        img = np.clip(img, 0, 1)
+        ax = plt.subplot(rows, cols, i + 1)
 
-        plt.imshow(img)
-        label_text = 'Tumor (1)' if labels[i].item() == 1 else 'Normal (0)'
-        color = 'red' if labels[i].item() == 1 else 'green'
-        plt.title(label_text, color=color)
-        plt.xticks([])
-        plt.yticks([])
+        img = images[i]
+
+        if denormalize:
+            img = img * std + mean
+
+        img = img.clamp(0, 1)
+        img = img.permute(1, 2, 0).numpy()
+
+        label = int(labels[i].item())
+        label_text = "Tumor (1)" if label == 1 else "Normal (0)"
+        color = "red" if label == 1 else "green"
+
+        ax.imshow(img)
+        ax.set_title(label_text, color=color)
+        ax.axis("off")
+
+    plt.tight_layout()
     plt.show()
-
-
-
-
-
-
-def build_pcam_loader(
-    data_root='./data',
-    img_size=224,
-    batch_size=64,
-    num_workers=2,
-    download=True,
-):
-    train_transforms = build_transforms(img_size, train=Ture)
-    eval_transforms = build_transforms(img_size, train=True)
-
-    train_dataset, val_dataset, test_dataset = load_pcam_datasets(
-        root = data_root,
-        train_transforms = train_transforms,
-        eval_transforms = eval_transforms,
-        download = download,
-    )
-
-    train_loader = make_loader(train_dataset, batch_size, shuffle=True, num_workers=num_workers)
-    val_loader = make_loader(val_dataset, batch_size, shuffle=False, num_workers=num_workers)
-    test_loader = make_loader(test_dataset, batch_size, shuffle=False, num_workers=num_workers)
-
-    return train_loader, val_loader, test_loader
-
 
 class PCamDataset(Dataset):
     """
     return: (image_tensor, label)
     """
-
-    def __init__(self, data_root:str, split:str, transform=None, download=False):
+    def __init__(self, data_root:str, split:str, transform: Optional[Callable]=None, download: bool=False):
         assert split in ['train', 'val', 'test'], f'invalid split: "{split}'
-        self._h5 = None,
+
+        is_download = download and not pcam_split_exists(data_root, split)
+
+        self._h5 = None
         self._pcam = None
+        self._h5_path = os.path.join(data_root, f"pcam_{split}.h5")
         self.dataset = torchvision.datasets.PCAM(
             root=data_root,
             split=split,
@@ -164,19 +168,49 @@ class PCamDataset(Dataset):
     def __len__(self):
         return len(self.dataset)
 
-    def _ensure_open(self):
+    """def _ensure_open(self):
         if self._h5 is None:
             import h5py
-            self._h5 = h5py.File(self._h5_path(), 'r')
+            self._h5 = h5py.File(self._h5_path, 'r')"""
             
     def __getitem__(self, idx):
-        self._ensure_open()
         x, y = self.dataset[idx] # x: [3, L, W], y: int (0/1)
         return x, int(y)
     
-    def __get_state__(self):
+    def __getstate__(self):
         d = dict(self.__dict__)
-        d['_h5'] = None
-        d['_pcam'] = None
         
         return d
+
+def build_pcam_loader(
+    data_root = PCAM_ROOT,
+    img_size=224,
+    batch_size=64,
+    num_workers=2,
+    download=True,
+):
+    # train_transforms = build_transforms(img_size, train=Ture)
+    # eval_transforms = build_transforms(img_size, train=True)
+
+    train_transforms = transforms.Compose([
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomVerticalFlip(),
+        transforms.ToTensor(),
+    ])
+
+    val_transforms = transforms.Compose([
+        transforms.ToTensor(),
+    ])
+
+    train_dataset, val_dataset, test_dataset = load_pcam_datasets(
+        root = data_root,
+        train_transforms = train_transforms,
+        val_transforms = val_transforms,
+        download = download,
+    )
+
+    train_loader = make_loader(train_dataset, batch_size = batch_size, shuffle = True, num_workers = num_workers, pin_memory = True)
+    val_loader = make_loader(val_dataset, batch_size = batch_size, shuffle = False, num_workers = num_workers, pin_memory = True)
+    return train_loader, val_loader
+
+
