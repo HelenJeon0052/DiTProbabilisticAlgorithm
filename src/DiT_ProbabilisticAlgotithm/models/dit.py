@@ -344,9 +344,12 @@ class PatchEmbed(nn.Module):
         self.patch = patch
         self.proj = nn.Conv2d(in_ch, embed_dim, kernel_size=patch, stride=patch)
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Tuple[int, int, int]]:
+        print(f"[patch embed] x: {x.shape}")
         x = self.proj(x)
+        print(f"[patch embed] xx: {x.shape}")
         B, E, Lp, Wp = x.shape
-        tokens = x.flatten(2).transpose(1, 2).contiguous()
+        tokens = x.flatten(2).transpose(1, 2).contiguous() # [Batch, Num_Patches, Embed_Dim]
+        print(f"[patch embed] tokens: {tokens.shape}")
 
         return tokens, (Lp, Wp)
 
@@ -362,11 +365,30 @@ class UnpatchifyEmbed(nn.Module):
         self.patch = patch
         self.proj = nn.ConvTranspose2d(embed_dim, out_ch, kernel_size=patch, stride=patch)
 
+    def manual_unpatchify(self, tokens, grid) -> torch.Tensor:
+        B, N, D = tokens.shape
+        Lp, Wp = grid
+        p = self.cfg.patch
+        C = self.cfg.out_channels
+
+        if N != Lp * Wp:
+            raise ValueError(f"N must equal Gh*Gw, got N={N}, grid={grid}")
+
+        expected_D = C * p * p
+        if D != expected_D:
+            raise ValueError(f"D must be C*p*p={expected_D}, got D={D}")
+
+        x = tokens.reshape(B, Lp, Wp, C, p, p)
+        x = x.permute(0, 3, 1, 4, 2, 5).contiguous()
+        x = x.reshape(B, C, Lp * p, Wp * p)
+
+        return x
+
     def forward(self, tokens, grid) -> torch.Tensor:
         B, N, D = tokens.shape
         Lp, Wp = grid
 
-        x = tokens.transpose(1, 2).reshape(B, E, Lp, Wp).contiguous()
+        x = tokens.transpose(1, 2).reshape(B, D, Lp, Wp).contiguous() # D = out_channels * patch * patch , [B, C, H, W]
 
         return self.proj(x)
 
@@ -408,6 +430,7 @@ class DiT2D(nn.Module):
         super().__init__()
 
         self.cfg = cfg
+        # print(f"DiT2D Config: {dataclasses.asdict(cfg)}")
         self.patch = PatchEmbed(cfg.in_channels, cfg.embed_dim, cfg.patch)
         self.unpatchify = UnpatchifyEmbed(cfg.embed_dim, cfg.out_channels, cfg.patch)
 
@@ -416,7 +439,7 @@ class DiT2D(nn.Module):
 
         num_tokens = (cfg.img_size // cfg.patch) ** 2
         self.postn = nn.Parameter(torch.zeros(1, num_tokens, cfg.embed_dim))
-        nn.init.trunc_normal_(self.postn, std=0.02)
+        # nn.init.trunc_normal_(self.postn, std=0.02)
 
         self.in_proj = nn.Linear(cfg.embed_dim, cfg.embed_dim)
         self.blocks = nn.ModuleList([
@@ -448,7 +471,9 @@ class DiT2D(nn.Module):
 
 
     def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        print(f"input x: {x.shape} | t: {t.shape}")
         tokens, grid = self.patch(x)
+        print(f"tokens : {tokens.shape} | grid: {grid}")
         if self.postn is not None:
             tokens = tokens + self.postn
         tokens = self.in_proj(tokens)
@@ -462,5 +487,6 @@ class DiT2D(nn.Module):
         eps = self.unpatchify(tokens, grid)
 
         if self.cfg.center_output:
+            # [B, 1, 1, 1] >> [B, C, 1, 1]
             eps = eps - eps.mean(dim=(1, 2, 3), keepdim = True)
         return eps
