@@ -165,13 +165,17 @@ class GaussianDiffusion(nn.Module):
             noise = torch.randn_like(x0)
         sqrt_ab = self._extract(self.sqrt_alpha_bar, t, x0.shape)
         sqrt_mab = self._extract(self.sqrt_one_minus_alpha_bar,t, x0.shape)
+        print(f"x0: {x0.shape} | t: {t.shape} | noise : {noise.shape}")
+        print(f"sqrt_ab: {sqrt_ab.shape} | sqrt_mab: {sqrt_mab.shape} | noise: {noise.shape}")
 
         xt = sqrt_ab * x0 + sqrt_mab * noise
+        print(f"xt: {xt.shape}")
 
         return xt, noise
 
     def p_losses(self, model, x0, t):
         xt, eps = self.q_sample(x0, t)
+        print(f"q_sample output xt: {xt.shape} | eps: {eps.shape}")
         eps_hat = model(xt, t)
 
         return F.mse_loss(eps_hat, eps)

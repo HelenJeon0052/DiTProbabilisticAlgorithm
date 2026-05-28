@@ -13,6 +13,9 @@ import random
 import shutil
 
 import numpy as np
+
+import matplotlib.pyplot as plt
+
 from torch.optim.lr_scheduler import LambdaLR
 
 
@@ -25,7 +28,7 @@ from torch.optim.lr_scheduler import LambdaLR
 # ------------------------------
 
 def set_seed(seed: int = 0):
-    randon.seed(seed)
+    random.seed(seed)
     torch.manual_seed(seed)
     np.random.seed(seed)
     torch.cuda.manual_seed_all(seed)
@@ -53,7 +56,7 @@ def make_mu_schedule(kind, iters, device):
 
     raise ValueError(f'Unknown schedule: {kind}')
 
-def sample_sigma(kind, n, sigma_min, sigma_max, device, *, sigma_center, rel_width, mix_ratio, eps = 1e-12, sort_dec = False):
+def sample_sigma(kind, n, sigma_min, sigma_max, device, *, sigma_center, rel_width, mix_ratio, eps = 1e-12, sort_dec = False, verbose = True):
     """
     training
         args:
@@ -87,10 +90,10 @@ def sample_sigma(kind, n, sigma_min, sigma_max, device, *, sigma_center, rel_wid
 
     def _band(m):
         u = torch.rand(m, device=device)
-        v = 2.0 * u - 1.0
-        v = v * torch.abs(v)
-        sigma = sigma_center * (1.0 + rel_width * v)
-        sigma = sigma.clamp(min = sigma_center * (1.0 + rel_width), max = sigma_center * (1.0 - rel_width))
+        # v = 2.0 * u - 1.0
+        # v = v * torch.abs(v)
+        # sigma = sigma.clamp(min = sigma_center * (1.0 - rel_width), max = sigma_center * (1.0 + rel_width))
+        sigma = u * (sigma_center * rel_width) + sigma_center
         sigma = sigma.clamp(min=sigma_min, max = sigma_max)
 
         return sigma
@@ -99,20 +102,31 @@ def sample_sigma(kind, n, sigma_min, sigma_max, device, *, sigma_center, rel_wid
         sigma = _log_uniform(n)
     elif kind == "band":
         sigma = _band(n)
-    else:
+    elif kind == "mix":
         n_log = int(round(n * mix_ratio))
         n_band = n - n_log
         sigma_log = _log_uniform(n_log) if n_log > 0 else torch.empty(0, device = device)
-        sigma_band = _band(n_log) if n_log > 0 else torch.empty(0, device = device)
+        sigma_band = _band(n_band) if n_band > 0 else torch.empty(0, device = device)
+        
         sigma = torch.cat([sigma_log, sigma_band], dim = 0)
-
-
+        print(f"n_log: {n_log} | n_band: {n_band} | sigma_log : {sigma_log.shape} | sigma_band: {sigma_band.shape}")
+    else:
+        raise ValueError(f"invalid sampling kind, {kind}")
+    
+    # preventing distribution collapse >> noise injection
+    sigma = sigma * torch.exp(1e-3 * torch.randn_like(sigma))
     sigma = sigma.clamp(min = sigma_min, max = sigma_max)
 
     if sort_dec:
         sigma = torch.sort (sigma, descending = True).values
     
-    print(f"sigma : {sigma} | {type(sigma)}")
+    print(f"sigma : {sigma.shape} | {type(sigma)}")
+
+    # sanity check
+    if verbose:
+        plt.hist(sigma.cpu().numpy(), bins = 100)
+        plt.show()
+        
     return sigma
 
 def make_mu_schedules(kind, iters, sigma_min, sigma_max, device, dec_sigma, eps: float = 1e-12, use_center_band: bool=True):
@@ -173,6 +187,7 @@ def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_st
     return LambdaLR(optimizer, lr_lambda)
 
 def normalize_sigma(sigma, g):
+
     if not torch.is_tensor(sigma):
       sigma = torch.tensor(sigma, device=g.device, dtype=g.dtype)
     if sigma.ndim == 0:
@@ -182,3 +197,41 @@ def normalize_sigma(sigma, g):
     if sigma.ndim == 2 and sigma.shape[1] == 1:
       sigma = sigma[:, 0]
     return sigma
+
+def make_gradient_denoiser(x0, t, *, grad_fn, noise: torch.Tensor | None, eps: float = 1e-12):
+    """
+    x0: [B, C, H, W]
+    grad_fn:
+            Function mapping [B, 3, H, W] -> [B, 6, H, W]
+    g0:
+            Clean gradient tensor [B, 6, H, W]
+        g_noisy:
+            Noisy gradient tensor [B, 6, H, W]
+    """
+
+    if x0.ndim != 4:
+        raise ValueError(f"x0 shape mismatch, got = {x0.shape}")
+    if x0.shape[1] != 3:
+        raise ValueError(f"expected x0 channel  3, got = {x0.shape[1]}")
+    
+    if t.ndim != 1:
+        raise ValueError(f"t shape mismatch, got = {t.shape}")
+    if t.shape[0] != x0.shape[0]:
+        print(f"t.shape: {t.shape}")
+        raise ValueError(f"expected batch of t and x0 must be identical, got {t.shape[0]} | {x0.shape[0]}")
+    
+
+    g = grad_fn(x0)
+
+    if noise is None:
+        noise = torch.randn_like(g)
+    else:
+        if noise.shape != g.shape:
+            raise ValueError(f"expected noise shape must be identical with shape of g, got= {noise.shape} | g = {g.shape}")
+
+    sigma_view = t.to(device = x0.device, dtype = x0.dtype).clamp_min(eps)
+    sigma_view = sigma_view.view(-1, 1, 1, 1)
+
+    g_noisy = g + sigma_view * noise
+
+    return g, g_noisy, noise, sigma_view
